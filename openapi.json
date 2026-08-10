@@ -1,0 +1,908 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "AI Commerce Readiness Agent API",
+    "description": "API para análise de prontidão de e-commerce para SEO, GEO (Gerenciado por Busca Generativa) e dados estruturados. Faz crawl do site, constrói um knowledge graph, detecta oportunidades e produz recomendações priorizadas com estimativas de impacto de negócio.\n\n## Visão Geral do Pipeline\n\n```\nURL → Crawler → Knowledge Graph → OpportunityAnalyzer → RecommendationEngine → GeoAgent → Report\n```\n\n## Autenticação\n\n- **API Key**: envie o header `x-api-key` para endpoints `/api/*` (exceto `/api/health` e `/api/config`).\n- **Análise Token**: endpoints de chat/aplicação/validação exigem `x-analysis-token` obtido do evento `done` da análise.\n\n## Streaming\n\nO endpoint `POST /api/analyze` retorna NDJSON (Newline Delimited JSON) com eventos de progresso em tempo real. Configure seu cliente para ler linha por linha.\n\n## Link Útil\n\n- **Swagger UI**: acesse `GET /api/docs` para a interface interativa.\n",
+    "version": "1.0.0",
+    "contact": {
+      "name": "AI Commerce Readiness Agent"
+    }
+  },
+  "servers": [
+    {
+      "url": "http://localhost:8787",
+      "description": "Servidor local de desenvolvimento"
+    }
+  ],
+  "security": [
+    {
+      "ApiKeyAuth": []
+    }
+  ],
+  "components": {
+    "securitySchemes": {
+      "ApiKeyAuth": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "x-api-key",
+        "description": "Chave de API para autenticação. Em produção, é obrigatória e deve ter pelo menos 32 caracteres."
+      },
+      "AnalysisToken": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "x-analysis-token",
+        "description": "Token de acesso da análise (obtido no evento `done` de `/api/analyze`). Necessário para endpoints que operam em uma sessão de análise específica."
+      }
+    },
+    "schemas": {
+      "AnalyzeRequest": {
+        "type": "object",
+        "required": ["url"],
+        "properties": {
+          "url": {
+            "type": "string",
+            "format": "uri",
+            "description": "URL pública do site e-commerce a ser analisado. Protocolos http e https são aceitos.",
+            "example": "https://www.exemplo.com.br"
+          },
+          "maxProducts": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 1000,
+            "default": 100,
+            "description": "Número máximo de produtos a extrair durante o crawl."
+          },
+          "business": {
+            "$ref": "#/components/schemas/BusinessInput"
+          }
+        }
+      },
+      "BusinessInput": {
+        "type": "object",
+        "description": "Dados de negócio do cliente para calibrar as estimativas de impacto. Todos os campos são opcionais; valores padrão são usados quando omitidos.",
+        "properties": {
+          "avgTicket": {
+            "type": "number",
+            "exclusiveMinimum": 0,
+            "description": "Ticket médio em moeda local (BRL por padrão).",
+            "example": 500
+          },
+          "monthlyOrganicSessions": {
+            "type": "integer",
+            "exclusiveMinimum": 0,
+            "description": "Volume mensal de sessões orgânicas. Se omitido, estimado via índice de oportunidade orgânica."
+          },
+          "organicConversionRate": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1,
+            "default": 0.02,
+            "description": "Taxa de conversão orgânica (0–1).",
+            "example": 0.015
+          },
+          "laborCostPerHour": {
+            "type": "number",
+            "exclusiveMinimum": 0,
+            "description": "Custo horário de mão de obra para cálculo de custo evitado."
+          },
+          "currency": {
+            "type": "string",
+            "pattern": "^[A-Z]{3}$",
+            "default": "BRL",
+            "description": "Código ISO 4217 da moeda.",
+            "example": "BRL"
+          }
+        }
+      },
+      "AnalyzeEvent": {
+        "type": "object",
+        "discriminator": {
+          "propertyName": "type"
+        },
+        "required": ["type", "at"],
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": ["stage", "crawl-progress", "done", "error"]
+          }
+        }
+      },
+      "StageEvent": {
+        "allOf": [
+          { "$ref": "#/components/schemas/AnalyzeEvent" },
+          {
+            "type": "object",
+            "required": ["stage", "label"],
+            "properties": {
+              "type": { "const": "stage" },
+              "stage": {
+                "type": "string",
+                "description": "Identificador do estágio: discovery, crawl, knowledge, opportunities, recommendations, geo"
+              },
+              "label": {
+                "type": "string",
+                "description": "Rótulo amigável do estágio"
+              }
+            }
+          }
+        ]
+      },
+      "CrawlProgressEvent": {
+        "allOf": [
+          { "$ref": "#/components/schemas/AnalyzeEvent" },
+          {
+            "type": "object",
+            "required": ["type"],
+            "properties": {
+              "type": { "const": "crawl-progress" },
+              "pages": { "type": "integer" },
+              "products": { "type": "integer" },
+              "discovered": { "type": "integer" },
+              "total": { "type": "integer" }
+            }
+          }
+        ]
+      },
+      "DoneEvent": {
+        "allOf": [
+          { "$ref": "#/components/schemas/AnalyzeEvent" },
+          {
+            "type": "object",
+            "required": ["type", "analysisId", "analysisAccessToken", "report"],
+            "properties": {
+              "type": { "const": "done" },
+              "analysisId": {
+                "type": "string",
+                "format": "uuid",
+                "description": "Identificador da sessão de análise para uso em endpoints de chat/validação."
+              },
+              "analysisAccessToken": {
+                "type": "string",
+                "description": "Token de acesso da análise (envie no header x-analysis-token nas chamadas subsequentes)."
+              },
+              "report": {
+                "$ref": "#/components/schemas/AnalysisReport"
+              }
+            }
+          }
+        ]
+      },
+      "ErrorEvent": {
+        "allOf": [
+          { "$ref": "#/components/schemas/AnalyzeEvent" },
+          {
+            "type": "object",
+            "required": ["type", "message"],
+            "properties": {
+              "type": { "const": "error" },
+              "message": { "type": "string" }
+            }
+          }
+        ]
+      },
+      "AnalysisReport": {
+        "type": "object",
+        "description": "Relatório completo da análise gerado pelo backend.",
+        "required": ["site", "healthScore", "health", "totalOpportunities", "executiveSummary", "recommendations", "topRecommendations", "automaticActions", "manualActions", "roadmap", "impactEstimate", "geo", "samples", "crawl"],
+        "properties": {
+          "analysisId": { "type": "string", "format": "uuid" },
+          "analyzedAt": { "type": "string", "format": "date-time" },
+          "site": { "$ref": "#/components/schemas/SiteInfo" },
+          "healthScore": { "type": "number", "minimum": 0, "maximum": 100 },
+          "health": { "$ref": "#/components/schemas/HealthResult" },
+          "totalOpportunities": { "type": "integer" },
+          "executiveSummary": { "type": "string" },
+          "executiveSummaryModel": { "$ref": "#/components/schemas/ExecutiveSummaryModel" },
+          "recommendations": { "type": "array", "items": { "$ref": "#/components/schemas/Recommendation" } },
+          "topRecommendations": { "type": "array", "items": { "$ref": "#/components/schemas/Recommendation" } },
+          "automaticActions": { "type": "array", "items": { "$ref": "#/components/schemas/Recommendation" } },
+          "manualActions": { "type": "array", "items": { "$ref": "#/components/schemas/Recommendation" } },
+          "roadmap": { "type": "array", "items": { "$ref": "#/components/schemas/RoadmapPhase" } },
+          "impactEstimate": { "$ref": "#/components/schemas/ImpactEstimate" },
+          "businessInput": { "$ref": "#/components/schemas/BusinessInput" },
+          "geo": { "$ref": "#/components/schemas/GeoReport" },
+          "samples": { "type": "array", "description": "Amostras de produtos representativos do catálogo." },
+          "crawl": { "$ref": "#/components/schemas/CrawlMeta" }
+        }
+      },
+      "SiteInfo": {
+        "type": "object",
+        "properties": {
+          "baseUrl": { "type": "string" },
+          "host": { "type": "string" },
+          "title": { "type": "string" }
+        }
+      },
+      "HealthResult": {
+        "type": "object",
+        "properties": {
+          "score": { "type": "number" },
+          "grade": { "type": "string", "enum": ["A", "B", "C", "D", "E", "F"] },
+          "label": { "type": "string" },
+          "explanation": { "$ref": "#/components/schemas/MetricExplanation" }
+        }
+      },
+      "Recommendation": {
+        "type": "object",
+        "required": ["id", "title", "category", "priority", "score", "action", "automatable"],
+        "properties": {
+          "id": { "type": "string", "description": "Ex: rec:op:schema-product", "example": "rec:op:schema-product" },
+          "opportunityId": { "type": "string" },
+          "title": { "type": "string" },
+          "description": { "type": "string" },
+          "category": { "type": "string", "enum": ["SEO", "GEO", "Conteudo", "Schema", "Produto"] },
+          "priority": { "type": "string", "enum": ["critica", "alta", "media", "baixa"] },
+          "impact": { "type": "string", "enum": ["muito_alto", "alto", "medio", "baixo"] },
+          "confidence": { "type": "number" },
+          "effort": { "type": "string", "enum": ["muito_baixo", "baixo", "medio", "alto"] },
+          "automatable": { "type": "boolean" },
+          "score": { "type": "number", "minimum": 0, "maximum": 100 },
+          "expectedImpact": { "type": "string" },
+          "action": { "$ref": "#/components/schemas/ConcreteAction" },
+          "affectedProducts": { "type": "integer" },
+          "businessImpact": { "$ref": "#/components/schemas/BusinessImpact" }
+        }
+      },
+      "ConcreteAction": {
+        "type": "object",
+        "properties": {
+          "title": { "type": "string" },
+          "description": { "type": "string" },
+          "steps": { "type": "array", "items": { "type": "string" } }
+        }
+      },
+      "RoadmapPhase": {
+        "type": "object",
+        "properties": {
+          "phase": { "type": "integer", "enum": [1, 2, 3] },
+          "name": { "type": "string" },
+          "objective": { "type": "string" },
+          "recommendations": { "type": "array", "items": { "$ref": "#/components/schemas/Recommendation" } }
+        }
+      },
+      "ImpactEstimate": {
+        "type": "object",
+        "properties": {
+          "automaticActions": { "type": "integer" },
+          "manualActions": { "type": "integer" },
+          "estimatedScoreGain": { "type": "number" },
+          "topCategory": { "type": "string" },
+          "aggregate": { "$ref": "#/components/schemas/AggregateImpact" }
+        }
+      },
+      "AggregateImpact": {
+        "type": "object",
+        "properties": {
+          "headline": { "$ref": "#/components/schemas/HeadlineEstimate" },
+          "potentialMaximum": {
+            "type": "object",
+            "properties": {
+              "revenue": { "$ref": "#/components/schemas/RevenueRange" },
+              "traffic": { "$ref": "#/components/schemas/TrafficRange" },
+              "costAvoided": { "$ref": "#/components/schemas/RevenueRange" }
+            }
+          },
+          "overlapRisk": { "type": "string", "enum": ["none", "low", "medium", "high"] },
+          "overlapIndex": { "type": "number" },
+          "evidence": { "$ref": "#/components/schemas/EvidenceResult" },
+          "highestOpportunity": { "$ref": "#/components/schemas/HighestOpportunity" },
+          "explanation": { "$ref": "#/components/schemas/MetricExplanation" },
+          "modelVersion": { "type": "string" }
+        }
+      },
+      "HeadlineEstimate": {
+        "type": "object",
+        "properties": {
+          "recommendationId": { "type": "string" },
+          "title": { "type": "string" },
+          "revenueLow": { "type": "number" },
+          "revenueHigh": { "type": "number" },
+          "trafficLow": { "type": "number" },
+          "trafficHigh": { "type": "number" },
+          "confidence": { "type": "string", "enum": ["HIGH", "MEDIUM", "LOW"] },
+          "opportunityScore": { "type": "number" },
+          "businessImpactLevel": { "type": "string", "enum": ["critical", "high", "medium", "low"] },
+          "explanation": { "$ref": "#/components/schemas/MetricExplanation" }
+        }
+      },
+      "HighestOpportunity": {
+        "type": "object",
+        "properties": {
+          "recommendationId": { "type": "string" },
+          "title": { "type": "string" },
+          "opportunityScore": { "type": "number" },
+          "businessImpactLevel": { "type": "string", "enum": ["critical", "high", "medium", "low"] },
+          "confidence": { "type": "string", "enum": ["HIGH", "MEDIUM", "LOW"] },
+          "explanation": { "$ref": "#/components/schemas/MetricExplanation" }
+        }
+      },
+      "BusinessImpact": {
+        "type": "object",
+        "properties": {
+          "opportunity": { "$ref": "#/components/schemas/OpportunityScoreResult" },
+          "businessImpactLevel": { "type": "string", "enum": ["critical", "high", "medium", "low"] },
+          "traffic": { "$ref": "#/components/schemas/TrafficEstimate" },
+          "revenue": { "$ref": "#/components/schemas/RevenueEstimate" },
+          "costAvoided": { "$ref": "#/components/schemas/CostEstimate" },
+          "confidence": { "$ref": "#/components/schemas/ConfidenceResult" },
+          "evidence": { "$ref": "#/components/schemas/EvidenceResult" },
+          "overlap": { "$ref": "#/components/schemas/OverlapResult" }
+        }
+      },
+      "OpportunityScoreResult": { "type": "object" },
+      "TrafficEstimate": { "type": "object" },
+      "RevenueEstimate": { "type": "object" },
+      "CostEstimate": { "type": "object" },
+      "ConfidenceResult": { "type": "object" },
+      "EvidenceResult": { "type": "object" },
+      "OverlapResult": { "type": "object" },
+      "MetricExplanation": {
+        "type": "object",
+        "description": "Explicabilidade aninhada para cada métrica de impacto.",
+        "properties": {
+          "metric": { "type": "string" },
+          "summary": { "type": "string" },
+          "formula": { "type": "string" },
+          "inputs": { "type": "array", "items": { "$ref": "#/components/schemas/ExplanationInput" } },
+          "rationale": { "type": "array", "items": { "$ref": "#/components/schemas/RationalePoint" } },
+          "assumptions": { "type": "array", "items": { "type": "string" } },
+          "modelVersion": { "type": "string" }
+        }
+      },
+      "ExplanationInput": {
+        "type": "object",
+        "properties": {
+          "key": { "type": "string" },
+          "label": { "type": "string" },
+          "display": { "type": "string" },
+          "value": { "type": ["number", "null"] },
+          "weight": { "type": ["number", "null"] },
+          "contribution": { "type": ["number", "null"] }
+        }
+      },
+      "RationalePoint": {
+        "type": "object",
+        "properties": {
+          "kind": { "type": "string", "enum": ["supporting", "missing", "warning"] },
+          "label": { "type": "string" },
+          "source": { "type": "string", "enum": ["SEARCH_CONSOLE", "GA4", "MERCHANT_CENTER", "CRAWLER", "STRUCTURED_DATA", "STATIC_ASSUMPTION"] }
+        }
+      },
+      "TrafficRange": {
+        "type": "object",
+        "properties": { "low": { "type": "number" }, "high": { "type": "number" } }
+      },
+      "RevenueRange": {
+        "type": "object",
+        "properties": {
+          "low": { "type": "number" },
+          "high": { "type": "number" },
+          "currency": { "type": "string" }
+        }
+      },
+      "GeoReport": {
+        "type": "object",
+        "properties": {
+          "overallScore": { "type": "number", "minimum": 0, "maximum": 100 },
+          "successRate": { "type": "number", "minimum": 0, "maximum": 1 },
+          "llmEnabled": { "type": "boolean" },
+          "categoryScores": { "type": "array" },
+          "personaScores": { "type": "array" },
+          "questionsTested": { "type": "integer" },
+          "evaluations": { "type": "array" },
+          "recommendations": { "type": "array" },
+          "journeys": { "type": "array" },
+          "simulationErrors": { "type": "array" },
+          "simulationMeta": { "type": "object" }
+        }
+      },
+      "CrawlMeta": {
+        "type": "object",
+        "properties": {
+          "pages": { "type": "integer" },
+          "products": { "type": "integer" },
+          "catalogCount": { "type": "integer" },
+          "pagesByType": { "type": "object" },
+          "categories": { "type": "object" },
+          "sitemap": { "type": "object" },
+          "crawlDurationMs": { "type": "integer" },
+          "timings": { "type": "object" },
+          "errors": { "type": "array", "items": { "type": "string" } }
+        }
+      },
+      "ChatRequest": {
+        "type": "object",
+        "required": ["analysisId", "message"],
+        "properties": {
+          "analysisId": { "type": "string", "format": "uuid" },
+          "message": { "type": "string", "maxLength": 4000, "description": "Pergunta do usuário ao Commerce Assistant." }
+        }
+      },
+      "ChatResponse": {
+        "type": "object",
+        "required": ["answer", "tool", "suggestions"],
+        "properties": {
+          "answer": { "type": "string", "description": "Resposta sintetizada em pt-BR (máx. 2.000 caracteres)." },
+          "tool": { "$ref": "#/components/schemas/AssistantToolResult" },
+          "suggestions": { "type": "array", "items": { "type": "string" } }
+        }
+      },
+      "AssistantToolResult": {
+        "type": "object",
+        "properties": {
+          "tool": { "type": "string", "description": "Nome da ferramenta acionada." },
+          "summary": { "type": "string" },
+          "evidence": { "type": "array", "items": { "type": "string" } },
+          "data": {}
+        }
+      },
+      "ApplyRequest": {
+        "type": "object",
+        "required": ["analysisId", "recommendationId"],
+        "properties": {
+          "analysisId": { "type": "string", "format": "uuid" },
+          "recommendationId": { "type": "string", "description": "ID da recomendação a aplicar." }
+        }
+      },
+      "ApplyResponse": {
+        "type": "object",
+        "properties": {
+          "recommendationId": { "type": "string" },
+          "recommendationTitle": { "type": "string" },
+          "artifact": { "$ref": "#/components/schemas/ResolvedArtifact" },
+          "counterfactual": { "$ref": "#/components/schemas/ApplyCounterfactualResult" },
+          "decision": { "$ref": "#/components/schemas/DecisionRecord" }
+        }
+      },
+      "ResolvedArtifact": {
+        "type": "object",
+        "properties": {
+          "kind": { "type": "string", "enum": ["json-ld", "content-brief", "implementation-ticket"] },
+          "filename": { "type": "string" },
+          "title": { "type": "string" },
+          "objective": { "type": "string" },
+          "acceptanceCriteria": { "type": "array", "items": { "type": "string" } },
+          "expectedImpact": { "type": "string" }
+        }
+      },
+      "ApplyCounterfactualResult": {
+        "type": "object",
+        "properties": {
+          "simulatable": { "type": "boolean" },
+          "totalJourneys": { "type": "integer" },
+          "beforeSuccess": { "type": "integer" },
+          "afterSuccess": { "type": "integer" },
+          "beforeSuccessRate": { "type": "number" },
+          "afterSuccessRate": { "type": "number" },
+          "resolvedJourneys": { "type": "integer" },
+          "avgConfidenceDelta": { "type": "number" },
+          "projectedAttributes": { "type": "array", "items": { "type": "string" } }
+        }
+      },
+      "DecisionRecord": {
+        "type": "object",
+        "properties": {
+          "recommendationId": { "type": "string" },
+          "status": { "type": "string", "enum": ["accepted", "rejected", "delegated", "blocked"] },
+          "note": { "type": "string" },
+          "updatedAt": { "type": "integer" }
+        }
+      },
+      "ValidateRequest": {
+        "type": "object",
+        "required": ["analysisId", "recommendationId"],
+        "properties": {
+          "analysisId": { "type": "string", "format": "uuid" },
+          "recommendationId": { "type": "string" }
+        }
+      },
+      "ValidateResponse": {
+        "type": "object",
+        "properties": {
+          "recommendationId": { "type": "string" },
+          "status": { "type": "string", "enum": ["still_present", "resolved"] },
+          "checkedAt": { "type": "string", "format": "date-time" },
+          "pages": { "type": "integer" },
+          "products": { "type": "integer" },
+          "evidence": { "type": "string" }
+        }
+      },
+      "Health": {
+        "type": "object",
+        "properties": {
+          "ok": { "type": "boolean", "example": true },
+          "service": { "type": "string", "example": "ai-commerce-readiness-agent" }
+        }
+      },
+      "Config": {
+        "type": "object",
+        "properties": {
+          "requiresApiKey": { "type": "boolean", "example": true }
+        }
+      },
+      "Error": {
+        "type": "object",
+        "properties": {
+          "error": { "type": "string" },
+          "requestId": { "type": "string" }
+        }
+      }
+    },
+    "responses": {
+      "TooManyRequests": {
+        "description": "Limite de requisições excedido. Aguarde antes de tentar novamente.",
+        "headers": {
+          "Retry-After": {
+            "description": "Segundos para tentar novamente.",
+            "schema": { "type": "integer" }
+          }
+        },
+        "content": {
+          "application/json": {
+            "schema": { "$ref": "#/components/schemas/Error" }
+          }
+        }
+      },
+      "ServiceUnavailable": {
+        "description": "Capacidade de análise ou chat ocupada. Tente novamente em instantes.",
+        "content": {
+          "application/json": {
+            "schema": { "$ref": "#/components/schemas/Error" }
+          }
+        }
+      }
+    }
+  },
+  "paths": {
+    "/api/health": {
+      "get": {
+        "tags": ["Sistema"],
+        "summary": "Verifica saúde do serviço",
+        "description": "Endpoint público (sem auth) para health check. Útil para load balancers e monitors.",
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "Serviço saudável.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Health" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/config": {
+      "get": {
+        "tags": ["Sistema"],
+        "summary": "Consulta configuração do cliente",
+        "description": "Endpoint público (sem auth). Informa se o cliente precisa enviar x-api-key.",
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "Configuração atual.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Config" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/auth/verify": {
+      "post": {
+        "tags": ["Autenticação"],
+        "summary": "Verifica credencial de API",
+        "description": "Retorna 200 se `x-api-key` é válida, 401 caso contrário.",
+        "security": [{ "ApiKeyAuth": [] }],
+        "responses": {
+          "200": {
+            "description": "Credencial válida.",
+            "content": {
+              "application/json": {
+                "schema": { "type": "object", "properties": { "ok": { "type": "boolean", "example": true } } }
+              }
+            }
+          },
+          "401": {
+            "description": "API key ausente ou inválida.",
+            "content": {
+              "application/json": { "schema": { "$ref": "#/components/schemas/Error" } }
+            }
+          }
+        }
+      }
+    },
+    "/api/analyze": {
+      "post": {
+        "tags": ["Análise"],
+        "summary": "Inicia análise de prontidão do e-commerce",
+        "description": "**Pipeline assíncrono via NDJSON streaming**:\n\n1. **discovery** — coleta robots.txt e sitemap.xml\n2. **crawl** — extração de páginas e produtos (BFS com limite de maxProducts)\n3. **knowledge** — montagem do knowledge graph\n4. **opportunities** — análise de oportunidades (SEO · GEO · Schema · Produto · Conteúdo)\n5. **recommendations** — priorização e roadmap\n6. **geo** — simulação de compradores (4 personas)\n7. **done** — relatório final com analysisId e analysisAccessToken\n\nSe o serviço estiver em produção, é necessário bloquear redes privadas (SSRF protection).",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/AnalyzeRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "NDJSON streaming. Cada linha é um evento JSON (stage, crawl-progress, done, error).",
+            "content": {
+              "application/x-ndjson": {
+                "schema": {
+                  "oneOf": [
+                    { "$ref": "#/components/schemas/StageEvent" },
+                    { "$ref": "#/components/schemas/CrawlProgressEvent" },
+                    { "$ref": "#/components/schemas/DoneEvent" },
+                    { "$ref": "#/components/schemas/ErrorEvent" }
+                  ]
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "URL inválida ou request malformado.",
+            "content": {
+              "application/json": { "schema": { "$ref": "#/components/schemas/Error" } }
+            }
+          },
+          "401": {
+            "description": "API key ausente ou inválida.",
+            "content": {
+              "application/json": { "schema": { "$ref": "#/components/schemas/Error" } }
+            }
+          },
+          "413": {
+            "description": "Corpo da requisição excede o limite de tamanho.",
+            "content": {
+              "application/json": { "schema": { "$ref": "#/components/schemas/Error" } }
+            }
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          }
+        }
+      }
+    },
+    "/api/chat": {
+      "post": {
+        "tags": ["Assistant"],
+        "summary": "Interage com o Commerce Assistant (chat)",
+        "description": "Envia uma mensagem ao agente de comércio que responde com base no catálogo e recomendações da análise. Pode acionar 12 tools (search_products, compare_products, inspect_opportunities, simulate_buyer, simulate_counterfactual, plan_actions, generate_artifact, apply_action, manage_decision, validate_action, build_brief, analyze_performance).",
+        "security": [{ "ApiKeyAuth": [] }, { "AnalysisToken": [] }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/ChatRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Resposta do assistente.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ChatResponse" }
+              }
+            }
+          },
+          "400": {
+            "description": "'analysisId' e 'message' são obrigatórios.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+          },
+          "403": {
+            "description": "Token de acesso da análise ausente ou inválido.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+          },
+          "404": {
+            "description": "Análise não encontrada ou expirada.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+          },
+          "409": {
+            "description": "Uma operação de agente já está em andamento para esta análise.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+          },
+          "413": {
+            "description": "Mensagem excede o limite de 4.000 caracteres.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          },
+          "504": {
+            "description": "Timeout da interação com o agente.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+          }
+        }
+      }
+    },
+    "/api/chat/reset": {
+      "post": {
+        "tags": ["Assistant"],
+        "summary": "Reseta o histórico de conversa da sessão",
+        "description": "Limpa o histórico de conversas da sessão de análise. Requer x-api-key e x-analysis-token.",
+        "security": [{ "ApiKeyAuth": [] }, { "AnalysisToken": [] }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["analysisId"],
+                "properties": {
+                  "analysisId": { "type": "string", "format": "uuid" }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Conversa resetada.",
+            "content": {
+              "application/json": {
+                "schema": { "type": "object", "properties": { "ok": { "type": "boolean", "example": true } } }
+              }
+            }
+          },
+          "400": {
+            "description": "'analysisId' é obrigatório.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+          },
+          "403": {
+            "description": "Token de acesso ausente ou inválido.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+          },
+          "404": {
+            "description": "Análise não encontrada ou expirada.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+          }
+        }
+      }
+    },
+    "/api/apply": {
+      "post": {
+        "tags": ["Recomendações"],
+        "summary": "Aplica uma recomendação (gera artefato + simulação contrafatorial)",
+        "description": "Aplica virtualmente uma recomendação: gera o artefato de correção (JSON-LD, content brief ou ticket de implementação) e roda uma re-simulação das jornadas de comprador (before/after) para estimar o efeito. Requer x-api-key e x-analysis-token.",
+        "security": [{ "ApiKeyAuth": [] }, { "AnalysisToken": [] }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/ApplyRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Recomendação aplicada virtualmente.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ApplyResponse" }
+              }
+            }
+          },
+          "400": {
+            "description": "'analysisId' e 'recommendationId' são obrigatórios.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+          },
+          "403": {
+            "description": "Token de acesso ausente ou inválido.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+          },
+          "404": {
+            "description": "Análise ou recomendação não encontrada.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+          },
+          "409": {
+            "description": "Operação já em andamento para esta análise.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+          },
+          "504": {
+            "description": "Timeout da aplicação.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+          }
+        }
+      }
+    },
+    "/api/validate": {
+      "post": {
+        "tags": ["Recomendações"],
+        "summary": "Revalida uma recomendação via re-crawl",
+        "description": "Rexecuta o crawl sobre o site alvo para verificar se a oportunidade ainda existe (still_present) ou foi resolvida.",
+        "security": [{ "ApiKeyAuth": [] }, { "AnalysisToken": [] }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/ValidateRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Resultado da validação.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ValidateResponse" }
+              }
+            }
+          },
+          "400": {
+            "description": "'analysisId' e 'recommendationId' são obrigatórios.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+          },
+          "403": {
+            "description": "Token de acesso ausente ou inválido.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+          },
+          "404": {
+            "description": "Análise ou recomendação não encontrada.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          },
+          "504": {
+            "description": "Timeout da revalidação.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+          }
+        }
+      }
+    },
+    "/api/docs": {
+      "get": {
+        "tags": ["Sistema"],
+        "summary": "Interface Swagger UI",
+        "description": "Página HTML do Swagger UI para explorar e testar a API interativamente.",
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "HTML do Swagger UI.",
+            "content": {
+              "text/html": {
+                "schema": { "type": "string" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/openapi.json": {
+      "get": {
+        "tags": ["Sistema"],
+        "summary": "Especificação OpenAPI (Swagger)",
+        "description": "Retorna a especificação OpenAPI 3.0 como JSON.",
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "Especificação OpenAPI.",
+            "content": {
+              "application/json": {
+                "schema": { "type": "object" }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "tags": [
+    { "name": "Sistema", "description": "Endpoints de saúde, configuração e documentação." },
+    { "name": "Autenticação", "description": "Verificação de credenciais." },
+    { "name": "Análise", "description": "Início e acompanhamento de análises de prontidão." },
+    { "name": "Assistant", "description": "Agente de comércio conversacional." },
+    { "name": "Recomendações", "description": "Aplicação e validação de recomendações." }
+  ]
+}
